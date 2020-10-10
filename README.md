@@ -1,7 +1,7 @@
 # MSc-Thesis
 Code used for my MSc thesis 
 
-Title: A Novel Approach to Examine the Prevalence of Depression Symptoms in 160m Tweets
+**Title:** A Novel Approach to Examine the Prevalence of Depression Symptoms in 160m Tweets
 
 **Files:**
 
