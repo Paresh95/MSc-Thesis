@@ -1,0 +1,442 @@
+---
+title: "Reddit"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library("quanteda", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+library(ROSE) #rebalancing training data
+library(pROC) #compute AUC
+library(glmnet) #ridge, lasso, elastic net
+library(e1071) #svm
+library(randomForest) #random forest
+library(xgboost) # extreme gradient boosting
+```
+
+```{r}
+#import data
+SR <- read.csv("reddit_all.csv", stringsAsFactors=F)
+
+#set class labels
+SR$class <- ifelse(SR$Subreddit %in% c("depression","SuicideWatch"), 1, 0)
+SR <- SR[!is.na(SR$class),]
+
+##2) Check no. in D & ND class, take a RS of the ND class (same no. as D class)
+#create df for D and ND & count no. of observations in each
+D <- SR[SR$class=='1',] 
+ND <- SR[SR$class=='0',] 
+prop.table(table(SR$class))
+#take RS of ND (same size as D) and combine with D
+set.seed(12356)
+ND <- ND[sample(nrow(ND), 97170), ]
+SR2 <- rbind(D, ND)
+
+#take RS of data for testing purposes
+SR2 <- SR2[sample(nrow(SR2), 10000), ]
+table(SR2$class)
+
+#Split train and test
+set.seed(123)
+train <- sample(1:nrow(SR2), floor(.80 * nrow(SR2))) 
+test <- (1:nrow(SR2))[1:nrow(SR2) %in% train == FALSE]
+```
+
+```{r}
+#hierachical clustering
+SR2_collapsed <- aggregate(SR2$Comment, list(SR2$Subreddit), paste, collapse="")
+colnames(SR2_collapsed) <- c("Subreddit", "Comment")
+
+SR2_corp <- corpus(SR2_collapsed, text_field = "Comment")
+docnames(SR2_corp) <- docvars(SR2_corp, "Subreddit")
+
+#clean data
+SR2_tokens <- tokens(SR2_corp, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE,
+                   remove_symbols=TRUE)
+SR2_tokens <- tokens_remove(SR2_tokens, c(stopwords("english"), "&gt;","/r/[0-9_A-Za-z]+","â[0-9_A-Za-z]+",
+                                "¤ï[0-9_A-Za-z]+","ð[0-9_A-Za-z]+", "\nð[0-9_A-Za-z]+", 
+                                "ì[0-9_A-Za-z]+", "ë[0-9_A-Za-z]+", "ê[0-9_A-Za-z]+", "o[0-9_A-Za-z]+",
+                                "oë_ê", "í", "ë", "oë","ê", "o.ís", "o2"))
+
+SR2_dfm <- dfm(SR2_tokens, tolower=TRUE, stem=TRUE,ngrams=1:2, verbose=TRUE)
+SR2_dfmW <- dfm_weight(SR2_dfm, "prop")
+
+diss_matrix <- textstat_dist(SR2_dfmW, method = "euclidean")
+hclust <- hclust(diss_matrix, method= "complete")
+plot(hclust, hang = -1) # complete linkage 
+
+# plot with border
+plot(hclust, cex=0.9, hang = -1) # call this line and next together
+rect.hclust(hclust, k=20, border=2:5)
+```
+
+```{r}
+#create corpus
+SRcorpus <- corpus(SR2$Comment)
+kwic(SRcorpus, "ë", window=10)[1:5,]
+summary(SRcorpus, n=4)
+
+#clean data
+SRtokens <- tokens(SRcorpus, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE,
+                   remove_symbols=TRUE)
+SRtokens <- tokens_remove(SRtokens, c(stopwords("english"), "&gt;","/r/[0-9_A-Za-z]+","â[0-9_A-Za-z]+",
+                                "¤ï[0-9_A-Za-z]+","ð[0-9_A-Za-z]+", "\nð[0-9_A-Za-z]+", 
+                                "ì[0-9_A-Za-z]+", "ë[0-9_A-Za-z]+", "ê[0-9_A-Za-z]+", "o[0-9_A-Za-z]+",
+                                "oë_ê", "í", "ë", "oë","ê", "o.ís", "o2"))
+
+SRdfm <- dfm(SRtokens, tolower=TRUE, stem=TRUE,ngrams=1:2, verbose=TRUE)
+
+#remove words that appear in <2 comments (documents)
+SRdfmT <- dfm_trim(SRdfm, min_docfreq = 2, max_docfreq = 0.9*nrow(SRdfm), verbose=TRUE)
+
+#tf_idf
+SRdfm_tf <- dfm_tfidf(SRdfmT)
+topfeatures(SRdfm_tf, 50)
+dim(SRdfm_tf)
+SRdfm_tf[1:5,1:5]
+```
+
+```{r}
+# Naive Bayes
+nb <- textmodel_nb(SRdfm_tf[train,], SR2$class[train]) 
+
+# predicting labels for test set
+pred <- predict(nb, newdata = SRdfm_tf[test,], type='class')
+
+# computing the confusion matrix
+(cm <- table(pred, SR2$class[test]))
+```
+
+```{r}
+# function to compute performance metrics
+precrecall <- function(mytable, verbose=TRUE) {
+    truePositives <- mytable[1,1]
+    falsePositives <- sum(mytable[1,]) - truePositives
+    falseNegatives <- sum(mytable[,1]) - truePositives
+    precision <- truePositives / (truePositives + falsePositives)
+    recall <- truePositives / (truePositives + falseNegatives)
+    if (verbose) {
+        print(mytable)
+        cat("\n precision =", round(precision, 2), 
+            "\n    recall =", round(recall, 2), "\n")
+    }
+    invisible(c(precision, recall))
+}
+
+
+pr <- precrecall(cm[2:1, 2:1]) # precision and recall
+round(sum(diag(cm)) / sum(cm), 2) # accuracy
+round(2 * prod(pr) / sum(pr), 2) #F1 score
+roc(SR2$class[test], as.numeric(pred)) #AUC
+```
+
+```{r}
+#get important features
+probs <- nb$PcGw
+
+df <- data.frame(
+  ngram = colnames(probs),
+  prob = probs[1,],
+  stringsAsFactors=F)
+df <- df[order(df$prob),]
+
+head(df, n=30)
+tail(df, n=20)
+```
+
+
+```{r}
+#ridge regression
+ridge <- cv.glmnet(x=SRdfm_tf[train,], y=SR2$class[train],
+                   alpha=0, nfolds=5, family="binomial")
+plot(ridge)
+
+pred <- predict(ridge, SRdfm_tf[test,], type="class")
+(cm <- table(pred, SR2$class[test]))
+# perfomance metrics
+
+# extracting coefficients
+best.lambda <- which(ridge$lambda==ridge$lambda.1se)
+beta <- ridge$glmnet.fit$beta[,best.lambda]
+
+## identifying predictive features
+df <- data.frame(coef = as.numeric(beta),
+                ngram = names(beta), stringsAsFactors=F)
+
+# lowest and highest coefficients
+df <- df[order(df$coef),]
+head(df[,c("coef", "ngram")], n=10)
+tail(df[,c("coef", "ngram")], n=10)
+```
+
+```{r}
+# lasso
+lasso <- cv.glmnet(x=SRdfm_tf[train,], y=SR2$class[train],
+                   alpha=1, nfolds=5, family="binomial")
+plot(lasso)
+
+pred <- predict(lasso, SRdfm_tf[test,], type="class")
+(cm <- table(pred, SR2$class[test]))
+# performance metrics
+
+# extracting coefficients
+best.lambda <- which(lasso$lambda==lasso$lambda.1se)
+beta <- lasso$glmnet.fit$beta[,best.lambda]
+
+# identifying predictive features
+df <- data.frame(coef = as.numeric(beta),
+                ngram = names(beta), stringsAsFactors=F)
+
+# note that some features become 0
+table(df$coef==0)
+
+df <- df[order(df$coef),]
+head(df[,c("coef", "ngram")], n=10)
+tail(df[,c("coef", "ngram")], n=10)
+```
+
+```{r}
+# Elastic net
+elnet <- cv.glmnet(x=SRdfm_tf[train,], y=SR2$class[train],
+                   alpha=0.5, nfolds=5, family="binomial")
+plot(elnet)
+
+pred <- predict(elnet, SRdfm_tf[test,], type="class")
+(cm <- table(pred, SR2$class[test]))
+# performance metrics
+
+# extracting coefficients
+best.lambda <- which(elnet$lambda==elnet$lambda.1se)
+beta <- elnet$glmnet.fit$beta[,best.lambda]
+
+# identifying predictive features
+df <- data.frame(coef = as.numeric(beta),
+                ngram = names(beta), stringsAsFactors=F)
+
+# note that some features become 0
+table(df$coef==0)
+
+df <- df[order(df$coef),]
+head(df[,c("coef", "ngram")], n=10)
+tail(df[,c("coef", "ngram")], n=10)
+```
+
+```{r}
+#SVM (just run tuned SVM code in the next cell)
+system.time(fit <- svm(x=SRdfm_tf[train,], y=factor(SR2$class[train]),
+           kernel="linear", cost=10, probability=TRUE))
+
+pred <- predict(fit, SRdfm_tf[test,])
+
+#confusion matrix
+(cm <- table(pred, SR2$class[test]))
+# performance metrics
+
+df <- data.frame(
+  vector = SR2$Comment[train][fit$index],
+  coef = fit$coefs,
+  stringsAsFactors = F
+)
+
+df <- df[order(df$coef),]
+head(df[,c("coef", "vector")], n=10)
+
+df <- df[order(df$coef, decreasing=TRUE),]
+head(df[,c("coef", "vector")], n=10)
+```
+
+```{r}
+# tuning svm
+system.time(fit <- tune(svm, train.x=SRdfm_tf[train,], 
+            train.y=factor(SR2$class[train]),
+            kernel="linear",
+            ranges=list(cost=c(0.001, 0.01, 0.1, 1, 5, 10, 100))))
+
+summary(fit)
+
+bestmodel <- fit$best.model
+summary(bestmodel)
+
+pred <- predict(bestmodel, SRdfm_tf[test,])
+
+#confusion matrix
+(cm <- table(pred, SR2$class[test]))
+# performance metrics
+
+```
+
+```{r}
+#Random Forests 
+rfdfm <- dfm_trim(SRdfm_tf, min_docfreq = 20, max_docfreq = 0.8*nrow(SRdfm), verbose=TRUE)
+X <- as.matrix(rfdfm)
+dim(X)
+system.time(rf <- randomForest(x=X[train,], y=factor(SR2$class[train]),
+                   xtest=X[test,], ytest=factor(SR2$class[test]),
+                   importance=TRUE, mtry=20, ntree=100, keep.forest=TRUE))
+
+rf #view test and OOB errors 
+x <- c(764, 221, 189, 826)  #input confusion matrix values (use test confusion matrix)
+cm <- matrix(x, nrow=2, ncol=2)
+pred <- predict(rf, SRdfm_tf[test,])
+# performance metrics
+
+importance(rf)
+varImpPlot(rf)
+
+```
+
+
+```{r}
+# Extreme gradient boosting 
+
+# converting matrix object
+X <- as(SRdfm_tf, "dgCMatrix")
+# parameters to explore
+tryEta <- c(1,2)
+tryDepths <- c(1,2,4)
+# placeholders for now
+bestEta=NA
+bestDepth=NA
+bestAcc=0
+
+for(eta in tryEta){
+  for(dp in tryDepths){ 
+    bst <- xgb.cv(data = X[train,], 
+            label =  SR2$class[train], 
+            max.depth = dp,
+          eta = eta, 
+          nthread = 4,
+          nround = 500,
+          nfold=5,
+          print_every_n = 100L,
+          objective = "binary:logistic")
+    # cross-validated accuracy
+    acc <- 1-mean(tail(bst$evaluation_log$test_error_mean))
+        cat("Results for eta=",eta," and depth=", dp, " : ",
+                acc," accuracy.\n",sep="")
+        if(acc>bestAcc){
+                bestEta=eta
+                bestAcc=acc
+                bestDepth=dp
+        }
+    }
+}
+
+cat("Best model has eta=",bestEta," and depth=", bestDepth, " : ",
+    bestAcc," accuracy.\n",sep="")
+```
+
+```{r}
+# running best model
+rf <- xgboost(data = X[train,], 
+    label = SR2$class[train], 
+        max.depth = bestDepth,
+    eta = bestEta, 
+    nthread = 4,
+    nround = 1000,
+        print_every_n=100L,
+    objective = "binary:logistic")
+
+# out-of-sample accuracy
+pred <- predict(rf, X[test,])
+
+#confusion matrix
+(cm <- table(pred>0.5, SR2$class[test]))
+# performance metrics
+
+# feature importance
+labels <- dimnames(X)[[2]]
+importance <- xgb.importance(labels, model = rf, data=X, label=SR2$class)
+
+importance <- importance[order(importance$Gain, decreasing=TRUE),]
+head(importance, n=30)
+tail(importance, n=30)
+```
+
+
+
+```{r}
+###Predicting test data
+#import tweets and take a sample for testing purposes 
+tweets <- read.csv("twitter-panel-export-000000000056.csv", stringsAsFactors=F, 
+                   header=TRUE, encoding='UTF-8')
+
+tweets <- tweets[sample(nrow(tweets), 2800000), ]
+tweetscorpus <- corpus(tweets$text)
+
+# data cleaning 
+tweetstokens <- tokens(tweetscorpus, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE,
+                   remove_symbols=TRUE, remove_twitter=TRUE)
+tweetstokens <- tokens_remove(tweetstokens, stopwords("english"))
+tweetsdfm <- dfm(tweetstokens, tolower=TRUE, stem=TRUE,ngrams=1:2, verbose=TRUE)
+
+#set feature names equal
+newtest <- dfm_select(tweetsdfm, SRdfm_tf, valuetype = "fixed", verbose = TRUE)
+newtest[1:2,1:5]
+setequal(featnames(newtest), featnames(SRdfm_tf))
+
+
+#make prediction using best model
+prediction <- predict(rf, newdata = newtest, type='class')
+
+#create df with prediction, filter to see prediction
+list <- as.vector(prediction)
+tweets_updated <- cbind(tweets, list)
+x <- tweets_updated[tweets_updated$list>'0.5',]  # this might be > '0.5' or == '1' for some algos
+x
+write.csv(x, file ="final tweets/1. Predicted tweets/xgb_depressed_tweets56.csv")
+```
+
+```{r}
+###testing classifier on known tweets
+#import tweets and take a sample for testing purposes 
+tweets <- read.csv("Tweets to test ML model.csv", stringsAsFactors=F, 
+                   header=TRUE, encoding='UTF-8')
+D <- tweets[tweets$label=='1',] 
+ND <- tweets[tweets$label=='0',] 
+prop.table(table(tweets$label))
+#take RS of ND (same size as D) and combine with D
+set.seed(12356)
+ND <- ND[sample(nrow(ND), 2314), ]
+tweets <- rbind(D, ND)
+
+tweetscorpus <- corpus(tweets$message)
+
+# data cleaning 
+tweetstokens <- tokens(tweetscorpus, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE,
+                   remove_symbols=TRUE, remove_twitter=TRUE)
+tweetstokens <- tokens_remove(tweetstokens, stopwords("english"))
+tweetsdfm <- dfm(tweetstokens, tolower=TRUE, stem=TRUE,ngrams=1:2, verbose=TRUE)
+
+
+#set feature names equal
+newtest <- dfm_select(tweetsdfm, SRdfm_tf, valuetype = "fixed", verbose = TRUE)
+newtest[1:2,1:5]
+setequal(featnames(newtest), featnames(SRdfm_tf))
+
+
+#make prediction - use XGB as AUC = 0.9
+prediction <- predict(rf, newdata = newtest, type='class')
+
+#create df with prediction, filter to see prediction
+list <- as.vector(prediction)
+tweets_updated <- cbind(tweets, list)
+x <- tweets_updated[tweets_updated$list>'0.5',]  # this might be > '0.5' or == '1' for 
+
+table(x$label)
+
+y <- c(1875, 439,176, 2138)  #input confusion matrix values (use test confusion matrix)
+cm <- matrix(y, nrow=2, ncol=2)
+cm[2:1, 2:1]
+pr <- precrecall(cm[2:1, 2:1]) # precision and recall
+round(sum(diag(cm)) / sum(cm), 2) # accuracy
+round(2 * prod(pr) / sum(pr), 2) #F1 score
+roc(tweets$label, as.numeric(prediction)) #AUC
+
+```
+
+
+

@@ -1,0 +1,179 @@
+---
+title: "1. Step 1 - Dictionary method"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r cars}
+library(RJSONIO)
+library("quanteda", quietly = TRUE, warn.conflicts = FALSE, verbose = FALSE)
+dict <- fromJSON("depression_lexicon_updated.json")
+dict <- dictionary(dict)
+```
+
+```{r}
+# read reddit data
+comments <- read.csv('reddit_depression_2016.csv', stringsAsFactors=F)
+#test <- comments[comments$Subreddit=='depression',] # test for dictionary applied to only depression subreddit
+
+redditcorpus <- corpus(comments$Comment)
+
+#clean data
+# remember do not stem words
+
+reddittokens <- tokens(redditcorpus, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE,
+                   remove_symbols=TRUE)
+str <- c("i'm", "myself", "am", "my")
+stopwords <- stopwords("english")
+require("tm")
+stopwords <- gsub(paste(str, collapse="|"), "", stopwords)
+reddittokens <- tokens_remove(reddittokens, c(stopwords,
+                                              "&gt;","/r/[0-9_A-Za-z]+","â[0-9_A-Za-z]+",
+                                "¤ï[0-9_A-Za-z]+","ð[0-9_A-Za-z]+", "\nð[0-9_A-Za-z]+", 
+                                "ì[0-9_A-Za-z]+", "ë[0-9_A-Za-z]+", "ê[0-9_A-Za-z]+", "o[0-9_A-Za-z]+",
+                                "oë_ê", "í", "ë", "oë","ê", "o.ís", "o2"))
+
+redditdfm <- dfm(reddittokens, tolower=TRUE,ngrams=1:3, verbose=TRUE)
+
+#remove words that appear in < 2 comments (documents)
+redditdfmT <- dfm_trim(redditdfm, min_docfreq = 2, verbose=TRUE)
+topfeatures(redditdfmT, 50)
+
+#wordcloud
+textplot_wordcloud(redditdfmT, max_words = 100)
+
+# apply dictionary 
+dep <- dfm_lookup(redditdfmT, dictionary = dict)
+# convert matrix to a dataframe
+dep <- convert(dep, to='data.frame')
+
+# get column totals
+totals <- colSums(dep[,-1])
+totals
+
+#add date and comments, remove document column, rename columns
+dep <- cbind(dep, comments$Date, comments$Comment)
+dep <- dep[, 2:13]
+colnames(dep) <- c("Absence of pleasure", "Depressed mood", "Insomnia", "Fatigue", "Weight loss",
+                   "Feelings of worthlessness", "Diminished concentration", "Agitation", "Suicidal thoughts",
+                   "Medication", "Date", "Comment")
+
+# remove rows where no symptoms present
+dep_clean <- dep[as.logical(rowSums(dep[1:10] != 0)), ]
+head(dep_clean$Comment, n = 20)
+
+write.csv(dep_clean, file ="final tables/reddit_dict_dfm.csv")
+
+```
+
+
+```{r}
+num <- as.character(1:56)
+
+for(i in num){
+  #import tweets
+  tweets2 <- read.csv(paste("final tweets/1. Predicted tweets/xgb_depressed_tweets",i,".csv", sep=""),
+                      stringsAsFactors=F)
+  
+  tweetcorpus <- corpus(tweets2$text)
+  
+  #clean data
+  # remember do not stem words
+  tweettokens <- tokens(tweetcorpus, remove_punct=TRUE, remove_url=TRUE, remove_numbers =TRUE,
+                     remove_symbols=TRUE)
+  tweettokens <- tokens_remove(tweettokens, c(stopwords,
+                                                "&gt;","/r/[0-9_A-Za-z]+","â[0-9_A-Za-z]+",
+                                  "¤ï[0-9_A-Za-z]+","ð[0-9_A-Za-z]+", "\nð[0-9_A-Za-z]+", 
+                                  "ì[0-9_A-Za-z]+", "ë[0-9_A-Za-z]+", "ê[0-9_A-Za-z]+", "o[0-9_A-Za-z]+",
+                                  "oë_ê", "í", "ë", "oë","ê", "o.ís", "o2"))
+  
+  tweetdfm <- dfm(tweettokens, tolower=TRUE,ngrams=1:3, verbose=TRUE)
+
+  
+  # apply dictionary 
+  dep <- dfm_lookup(tweetdfm, dictionary = dict)
+  
+  # convert matrix to a dataframe
+  dep <- convert(dep, to='data.frame')
+  
+  # get column totals
+  totals <- colSums(dep[,-1])
+  totals
+  
+  #add date and comments, remove document column, rename columns
+  dep <- cbind(dep, tweets2$datetime, tweets2$text, tweets2$user_id_str)
+  dep <- dep[, 2:14]
+  colnames(dep) <- c("Absence of pleasure", "Depressed mood", "Insomnia", "Fatigue", "Weight loss",
+                     "Feelings of worthlessness", "Diminished concentration", "Agitation",
+                     "Suicidal thoughts", "Medication", "Date", "Comment", "ID")
+  
+  # remove rows where no symptoms present
+  dep_clean <- dep[as.logical(rowSums(dep[1:10] != 0)), ]
+  #head(dep_clean$Comment, n = 20)
+  
+  write.csv(dep_clean, file = paste("final tweets/2. Final cleaned tweets/xgb_tweets",i,".csv", sep=""))
+  print(paste("Done",i, sep = " "))
+}
+
+
+```
+
+
+```{r}
+#sort out encoding issues for above tweets
+trueunicode.hack <- function(string){
+    m <- gregexpr("<U\\+[0-9A-F]{4}>", string)
+    if(-1==m[[1]][1])
+        return(string)
+
+    codes <- unlist(regmatches(string, m))
+    replacements <- codes
+    N <- length(codes)
+    for(i in 1:N){
+        replacements[i] <- intToUtf8(strtoi(paste0("0x", substring(codes[i], 4, 7))))
+    }
+
+    # if the string doesn't start with a unicode, the copy its initial part
+    # until first occurrence of unicode
+    if(1!=m[[1]][1]){
+        y <- substring(string, 1, m[[1]][1]-1)
+        y <- paste0(y, replacements[1])
+    }else{
+        y <- replacements[1]
+    }
+
+    # if more than 1 unicodes in the string
+    if(1<N){
+        for(i in 2:N){
+            s <- gsub("<U\\+[0-9A-F]{4}>", replacements[i], 
+                      substring(string, m[[1]][i-1]+8, m[[1]][i]+7))
+            Encoding(s) <- "UTF-8"
+            y <- paste0(y, s)
+        }
+    }
+
+    # get the trailing contents, if any
+    if( nchar(string)>(m[[1]][N]+8) )
+        y <- paste0( y, substring(string, m[[1]][N]+8, nchar(string)) )
+    y
+}
+
+# encode tweets 
+trueunicode.hack(tweets2$text[23]) # see ML code for the full function
+
+#alternative method to encode
+library(stringi)
+cat(stri_unescape_unicode(gsub("<U\\+(....)>", "\\\\u\\1", tweets2$text[25])))
+
+for (i in 1:nrow(x)){
+  x$text[i] = stri_unescape_unicode(gsub("<U\\+(....)>", "\\\\u\\1", x$text[i]))}
+
+```
+
+
+
